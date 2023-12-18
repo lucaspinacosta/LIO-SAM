@@ -6,6 +6,7 @@
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/slam/PriorFactor.h>
 #include <gtsam/slam/BetweenFactor.h>
+#include <gtsam/slam/dataset.h>
 #include <gtsam/navigation/GPSFactor.h>
 #include <gtsam/navigation/ImuFactor.h>
 #include <gtsam/navigation/CombinedImuFactor.h>
@@ -16,6 +17,8 @@
 #include <gtsam/inference/Symbol.h>
 
 #include <gtsam/nonlinear/ISAM2.h>
+
+#include "Scancontext.h"
 
 using namespace gtsam;
 
@@ -45,6 +48,7 @@ POINT_CLOUD_REGISTER_POINT_STRUCT (PointXYZIRPYT,
                                    (double, time, time))
 
 typedef PointXYZIRPYT  PointTypePose;
+
 
 
 class mapOptimization : public ParamServer
@@ -81,6 +85,8 @@ public:
     ros::Subscriber subLoop;
 
     ros::ServiceServer srvSaveMap;
+    //ros::ServiceClient srvSaveImage;
+    // std_srvs::Empty srvImage;
 
     std::deque<nav_msgs::Odometry> gpsQueue;
     lio_sam::cloud_info cloudInfo;
@@ -91,6 +97,7 @@ public:
     pcl::PointCloud<PointType>::Ptr cloudKeyPoses3D;
     pcl::PointCloud<PointTypePose>::Ptr cloudKeyPoses6D;
     pcl::PointCloud<PointType>::Ptr copy_cloudKeyPoses3D;
+    pcl::PointCloud<PointType>::Ptr copy_cloudKeyPoses2D; // Scan Context
     pcl::PointCloud<PointTypePose>::Ptr copy_cloudKeyPoses6D;
 
     pcl::PointCloud<PointType>::Ptr laserCloudCornerLast; // corner feature set from odoOptimization
@@ -120,6 +127,7 @@ public:
     pcl::KdTreeFLANN<PointType>::Ptr kdtreeSurroundingKeyPoses;
     pcl::KdTreeFLANN<PointType>::Ptr kdtreeHistoryKeyPoses;
 
+    pcl::VoxelGrid<PointType> downSizeFilterSC; // Scan Context
     pcl::VoxelGrid<PointType> downSizeFilterCorner;
     pcl::VoxelGrid<PointType> downSizeFilterSurf;
     pcl::VoxelGrid<PointType> downSizeFilterICP;
@@ -134,7 +142,8 @@ public:
     std::mutex mtxLoopInfo;
 
     bool isDegenerate = false;
-    cv::Mat matP;
+    // cv::Mat matP;
+    Eigen::Matrix<float, 6, 6> matP; // Scan Context
 
     int laserCloudCornerFromMapDSNum = 0;
     int laserCloudSurfFromMapDSNum = 0;
@@ -142,10 +151,14 @@ public:
     int laserCloudSurfLastDSNum = 0;
 
     bool aLoopIsClosed = false;
-    map<int, int> loopIndexContainer; // from new to old
+    // map<int, int> loopIndexContainer; // from new to old
+    multimap<int, int> loopIndexContainer; // from new to old // Scan Context
+
     vector<pair<int, int>> loopIndexQueue;
     vector<gtsam::Pose3> loopPoseQueue;
-    vector<gtsam::noiseModel::Diagonal::shared_ptr> loopNoiseQueue;
+    // vector<gtsam::noiseModel::Diagonal::shared_ptr> loopNoiseQueue; // Diagonal <- Gausssian <- Base
+    vector<gtsam::SharedNoiseModel> loopNoiseQueue; // Scan Context for polymorhpisam (Diagonal <- Gausssian <- Base)
+
     deque<std_msgs::Float64MultiArray> loopInfoVec;
 
     nav_msgs::Path globalPath;
@@ -154,13 +167,67 @@ public:
     Eigen::Affine3f incrementalOdometryAffineFront;
     Eigen::Affine3f incrementalOdometryAffineBack;
 
+    // loop detector
+    SCManager scManager; // Scan Context
+
+    // ************** Localization ***********
+    std::string saveNodePCDDirectory;
+    std::string saveCornerKeyFramePCDDirectory;
+    std::string saveSurfKeyFramePCDDirectory;
+    std::string saveSCDDirectory; // Scan Context
+    std::fstream pgTimeSaveStream;
+    std::fstream similarityScoreSaveStream;
+    std::fstream cmScoreSaveStream;
+    std::fstream fitnessScoreSaveStream;
+
+    NonlinearFactorGraph gtSAMgraphFromFile;
+    Values initialEstimateFromFile;
+    Values isamCurrentEstimateFromFile;
+
+    pcl::PointCloud<PointType>::Ptr cloudGlobalMap;
+    pcl::PointCloud<PointType>::Ptr cloudGlobalMapDS;
+    pcl::PointCloud<PointType>::Ptr cloudScanForInitialize;
+
+    pcl::PointCloud<PointType>::Ptr laserCloudRaw;
+    pcl::PointCloud<PointType>::Ptr laserCloudRawDS;
+
+    pcl::PointCloud<PointType>::Ptr cloudCornerFromFile;
+    pcl::PointCloud<PointType>::Ptr cloudSurfFromFile;
+    pcl::PointCloud<PointType>::Ptr cloudGlobalFromFile;
+
+    pcl::PointCloud<PointType>::Ptr cloudKeyPoses3DFromFile;
+    pcl::PointCloud<PointType>::Ptr cloudKeyPoses3D_Q_FromFile;
+    pcl::PointCloud<PointTypePose>::Ptr cloudKeyPoses6DFromFile;
+
+    vector<pcl::PointCloud<PointType>::Ptr> cornerCloudKeyFramesFromFile;
+    vector<pcl::PointCloud<PointType>::Ptr> surfCloudKeyFramesFromFile;
+
+    std::mutex mtx_general;
+
+    enum InitializedFlag
+    {
+        NonInitialized,
+        Initializing,
+        Initialized
+    };
+    InitializedFlag initializedFlag;
+
+    float initialPose[6];
+    double laserCloudRawTime;
+    float transformInTheWorld[6];
+
+    // Scan Context
+    std::vector<Eigen::MatrixXd> polarcontexts_FromFile;
+    std::vector<Eigen::MatrixXd> polarcontexts_Q_FromFile;
 
     mapOptimization()
     {
-        ISAM2Params parameters;
-        parameters.relinearizeThreshold = 0.1;
-        parameters.relinearizeSkip = 1;
-        isam = new ISAM2(parameters);
+        // ISAM2Params parameters;
+        // parameters.relinearizeThreshold = 0.1;
+        // parameters.relinearizeSkip = 1;
+        // if (factorization == 1)
+        //     parameters.factorization = gtsam::ISAM2Params::QR;
+        // isam = new ISAM2(parameters);
 
         pubKeyPoses                 = nh.advertise<sensor_msgs::PointCloud2>("lio_sam/mapping/trajectory", 1);
         pubLaserCloudSurround       = nh.advertise<sensor_msgs::PointCloud2>("lio_sam/mapping/map_global", 1);
@@ -173,14 +240,18 @@ public:
         subLoop  = nh.subscribe<std_msgs::Float64MultiArray>("lio_loop/loop_closure_detection", 1, &mapOptimization::loopInfoHandler, this, ros::TransportHints().tcpNoDelay());
 
         srvSaveMap  = nh.advertiseService("lio_sam/save_map", &mapOptimization::saveMapService, this);
+        // srvSaveImage = nh.serviceClient<std_srvs::Empty>("image_saver/save");
 
         pubHistoryKeyFrames   = nh.advertise<sensor_msgs::PointCloud2>("lio_sam/mapping/icp_loop_closure_history_cloud", 1);
         pubIcpKeyFrames       = nh.advertise<sensor_msgs::PointCloud2>("lio_sam/mapping/icp_loop_closure_corrected_cloud", 1);
-        pubLoopConstraintEdge = nh.advertise<visualization_msgs::MarkerArray>("/lio_sam/mapping/loop_closure_constraints", 1);
+        pubLoopConstraintEdge = nh.advertise<visualization_msgs::MarkerArray>("lio_sam/mapping/loop_closure_constraints", 1);
 
         pubRecentKeyFrames    = nh.advertise<sensor_msgs::PointCloud2>("lio_sam/mapping/map_local", 1);
         pubRecentKeyFrame     = nh.advertise<sensor_msgs::PointCloud2>("lio_sam/mapping/cloud_registered", 1);
         pubCloudRegisteredRaw = nh.advertise<sensor_msgs::PointCloud2>("lio_sam/mapping/cloud_registered_raw", 1);
+
+        const float kSCFilterSize = 0.5; // Scan Context
+        downSizeFilterSC.setLeafSize(kSCFilterSize, kSCFilterSize, kSCFilterSize); // Scan Context
 
         pubSLAMInfo           = nh.advertise<lio_sam::cloud_info>("lio_sam/mapping/slam_info", 1);
 
@@ -190,6 +261,24 @@ public:
         downSizeFilterSurroundingKeyPoses.setLeafSize(surroundingKeyframeDensity, surroundingKeyframeDensity, surroundingKeyframeDensity); // for surrounding key poses of scan-to-map optimization
 
         allocateMemory();
+
+        pcl::console::setVerbosityLevel(pcl::console::L_ERROR); // Scan Context
+
+        switch(liosamMode) {
+            case 0:
+                initNameFolder(std::getenv("ROS_MAP_PATH_DEFAULT"));
+                slamModeInit();
+                break;
+            case 1:
+                initNameFolder(std::getenv("ROS_MAP_PATH_DEFAULT"));
+                locModeInit();
+                break;
+            case 2:
+                appModeInit();
+                break;
+            default:
+                cout << "LIO-SAM must be initialized." << endl;
+        }
     }
 
     void allocateMemory()
@@ -197,6 +286,7 @@ public:
         cloudKeyPoses3D.reset(new pcl::PointCloud<PointType>());
         cloudKeyPoses6D.reset(new pcl::PointCloud<PointTypePose>());
         copy_cloudKeyPoses3D.reset(new pcl::PointCloud<PointType>());
+        copy_cloudKeyPoses2D.reset(new pcl::PointCloud<PointType>()); // Scan Context
         copy_cloudKeyPoses6D.reset(new pcl::PointCloud<PointTypePose>());
 
         kdtreeSurroundingKeyPoses.reset(new pcl::KdTreeFLANN<PointType>());
@@ -232,7 +322,106 @@ public:
             transformTobeMapped[i] = 0;
         }
 
-        matP = cv::Mat(6, 6, CV_32F, cv::Scalar::all(0));
+        // matP = cv::Mat(6, 6, CV_32F, cv::Scalar::all(0)); // Scan Context
+        matP.setZero();
+
+        // ************** Localization ***********
+        cloudGlobalMap.reset(new pcl::PointCloud<PointType>());
+	    cloudGlobalMapDS.reset(new pcl::PointCloud<PointType>());
+        cloudScanForInitialize.reset(new pcl::PointCloud<PointType>());
+
+        laserCloudRaw.reset(new pcl::PointCloud<PointType>());
+        laserCloudRawDS.reset(new pcl::PointCloud<PointType>());
+
+        cloudCornerFromFile.reset(new pcl::PointCloud<PointType>());
+	    cloudSurfFromFile.reset(new pcl::PointCloud<PointType>());
+        cloudGlobalFromFile.reset(new pcl::PointCloud<PointType>());
+
+        cloudKeyPoses3DFromFile.reset(new pcl::PointCloud<PointType>());
+        cloudKeyPoses3D_Q_FromFile.reset(new pcl::PointCloud<PointType>());
+        cloudKeyPoses6DFromFile.reset(new pcl::PointCloud<PointTypePose>());
+
+        for (int i = 0; i < 6; ++i){
+            initialPose[i] = 0;
+        }
+
+        for (int i = 0; i < 6; ++i){
+            transformInTheWorld[i] = 0;
+        }
+    }
+
+    void slamModeInit()
+    {
+        cout << "****************************************************" << endl;
+        cout << "LIO-SAM: SLAM Mode" << endl;
+        cout << "****************************************************" << endl;
+        initializedFlag = Initialized;
+        ISAM2Params parameters;
+        parameters.relinearizeThreshold = 0.1;
+        parameters.relinearizeSkip = 1;
+        parameters.factorization = gtsam::ISAM2Params::CHOLESKY;
+        isam = new ISAM2(parameters);
+        if (savePCD == true)
+            initFolder();
+        feedback_mode = 0;
+    }
+
+    void locModeInit()
+    {
+        cout << "****************************************************" << endl;
+        cout << "LIO-SAM: Localization Mode" << endl;
+        cout << "****************************************************" << endl;
+        initializedFlag = NonInitialized;
+        ISAM2Params parameters;
+        parameters.relinearizeThreshold = 0.1;
+        parameters.relinearizeSkip = 1;
+        parameters.factorization = gtsam::ISAM2Params::QR;
+        isam = new ISAM2(parameters);
+        savePCD = false;
+        saveGTSAM = false;
+
+        if (!loadGraph())
+        {
+        ROS_ERROR("It was not possible to load graph.");
+        ros::shutdown();
+        }
+
+        if (!cloudGlobalLoad())
+        {
+        ROS_ERROR("It was not possible to load global map.");
+        }
+
+        if (!(loadFiles() == 0))
+        {
+        ROS_ERROR("It was not possible to load files.");
+        ros::shutdown();
+        }
+
+        *cloudKeyPoses3D = *cloudKeyPoses3DFromFile;
+        *cloudKeyPoses6D = *cloudKeyPoses6DFromFile;
+
+        std::cout << " **** Points (cloudKeyPoses3D): " << cloudKeyPoses3D->points.size() << std::endl;
+        std::cout << " **** Points (cloudKeyPoses6D): " << cloudKeyPoses6D->points.size() << std::endl;
+
+        for (int i = 0; i < (int)cloudKeyPoses3D->size(); i++)
+        {
+        cornerCloudKeyFrames.push_back(cornerCloudKeyFramesFromFile[i]);
+        surfCloudKeyFrames.push_back(surfCloudKeyFramesFromFile[i]);
+        }
+        feedback_mode = 1;
+    }
+
+    void appModeInit()
+    {
+        cout << "****************************************************" << endl;
+        cout << "LIO-SAM: App Mode" << endl;
+        cout << "****************************************************" << endl;
+        cout << "" << endl;
+        cout << "Waiting...." << endl;
+        cout << "" << endl;
+
+        app_waiting_user = true;
+        feedback_mode = 3;
     }
 
     void laserCloudInfoHandler(const lio_sam::cloud_infoConstPtr& msgIn)
@@ -245,6 +434,38 @@ public:
         cloudInfo = *msgIn;
         pcl::fromROSMsg(msgIn->cloud_corner,  *laserCloudCornerLast);
         pcl::fromROSMsg(msgIn->cloud_surface, *laserCloudSurfLast);
+
+        pcl::fromROSMsg(msgIn->cloud_deskewed,  *laserCloudRaw);
+        laserCloudRawTime = cloudInfo.header.stamp.toSec();
+
+        // Waiting Application
+        if (app_waiting_user == true)
+            return;
+
+        if ((liosamMode == 2) && (app_initialized != true))
+        {
+            initNameFolder(app_map_name);
+            if (app_liosam_mode == 0) {
+                slamModeInit();
+                app_initialized = true;
+
+            } else if (app_liosam_mode == 1) {
+                locModeInit();
+                app_initialized = true;
+            } else {
+                ROS_ERROR("Reapet the message: wrong mode.");
+                app_waiting_user = true;
+            }
+        }
+
+        if (initializedFlag == NonInitialized || initializedFlag == Initializing)
+        {
+            if (cloudScanForInitialize->points.size() == 0)
+            {
+                initLocalization();
+            }
+            return;
+        }
 
         std::lock_guard<std::mutex> lock(mtx);
 
@@ -355,16 +576,23 @@ public:
 
     bool saveMapService(lio_sam::save_mapRequest& req, lio_sam::save_mapResponse& res)
     {
+      if (cloudKeyPoses3D->points.empty()){
+        cout << "Input point cloud has no data" << endl;
+        return false;
+      }
+
       string saveMapDirectory;
 
       cout << "****************************************************" << endl;
       cout << "Saving map to pcd files ..." << endl;
-      if(req.destination.empty()) saveMapDirectory = std::getenv("HOME") + savePCDDirectory;
+    //   if(req.destination.empty()) saveMapDirectory = std::getenv("HOME") + savePCDDirectory;
+    //   else saveMapDirectory = std::getenv("HOME") + req.destination;
+      if(req.destination.empty()) saveMapDirectory = saveMainDirectory;
       else saveMapDirectory = std::getenv("HOME") + req.destination;
       cout << "Save destination: " << saveMapDirectory << endl;
       // create directory and remove old files;
-      int unused = system((std::string("exec rm -r ") + saveMapDirectory).c_str());
-      unused = system((std::string("mkdir -p ") + saveMapDirectory).c_str());
+      // int unused = system((std::string("exec rm -r ") + saveMapDirectory).c_str());
+      // unused = system((std::string("mkdir -p ") + saveMapDirectory).c_str());
       // save key frame transformations
       pcl::io::savePCDFileBinary(saveMapDirectory + "/trajectory.pcd", *cloudKeyPoses3D);
       pcl::io::savePCDFileBinary(saveMapDirectory + "/transformations.pcd", *cloudKeyPoses6D);
@@ -424,7 +652,10 @@ public:
         ros::Rate rate(0.2);
         while (ros::ok()){
             rate.sleep();
-            publishGlobalMap();
+            if (globalMapVisualizationFile == true)
+                publishMap();
+            else
+                publishGlobalMap();
         }
 
         if (savePCD == false)
@@ -510,7 +741,10 @@ public:
         while (ros::ok())
         {
             rate.sleep();
-            performLoopClosure();
+            if (performRSLoopClosureFlag)
+                performLoopClosure();
+            if (performSCLoopClosureFlag)
+                performSCLoopClosure(); // Scan Context
             visualizeLoopClosure();
         }
     }
@@ -534,6 +768,8 @@ public:
 
         mtx.lock();
         *copy_cloudKeyPoses3D = *cloudKeyPoses3D;
+        copy_cloudKeyPoses2D->clear(); // Scan Context
+        *copy_cloudKeyPoses2D = *cloudKeyPoses3D; // Scan Context
         *copy_cloudKeyPoses6D = *cloudKeyPoses6D;
         mtx.unlock();
 
@@ -605,8 +841,143 @@ public:
         mtx.unlock();
 
         // add loop constriant
-        loopIndexContainer[loopKeyCur] = loopKeyPre;
+        // loopIndexContainer[loopKeyCur] = loopKeyPre;
+        loopIndexContainer.insert(std::pair<int, int>(loopKeyCur, loopKeyPre)); // Scan Context for multimap
     }
+
+
+    void performSCLoopClosure()
+    {
+        if (cloudKeyPoses3D->points.empty() == true)
+            return;
+
+        mtx.lock();
+        *copy_cloudKeyPoses3D = *cloudKeyPoses3D;
+        copy_cloudKeyPoses2D->clear(); // Scan Context
+        *copy_cloudKeyPoses2D = *cloudKeyPoses3D; // Scan Context
+        *copy_cloudKeyPoses6D = *cloudKeyPoses6D;
+        mtx.unlock();
+
+        if (scManager.polarcontexts_.size() == 0)
+            return;
+
+        // find keys
+        auto detectResult = scManager.detectLoopClosureID(); // first: nn index, second: yaw diff
+        int loopKeyCur = copy_cloudKeyPoses3D->size() - 1;;
+        int loopKeyPre = detectResult.first;
+        float yawDiffRad = detectResult.second; // not use for v1 (because pcl icp withi initial somthing wrong...)
+        if( loopKeyPre == -1 /* No loop found */)
+            return;
+
+        // std::cout << "SC loop found! between " << loopKeyCur << " and " << loopKeyPre << "." << std::endl; // giseop
+
+        // extract cloud
+        pcl::PointCloud<PointType>::Ptr cureKeyframeCloud(new pcl::PointCloud<PointType>());
+        pcl::PointCloud<PointType>::Ptr prevKeyframeCloud(new pcl::PointCloud<PointType>());
+        {
+
+            loopFindNearKeyframes(cureKeyframeCloud, loopKeyCur, 0);
+            loopFindNearKeyframes(prevKeyframeCloud, loopKeyPre, historyKeyframeSearchNum);
+            
+            // loopFindNearKeyframesWithRespectTo(cureKeyframeCloud, loopKeyCur, 0, loopKeyPre); // giseop
+            // loopFindNearKeyframes(prevKeyframeCloud, loopKeyPre, historyKeyframeSearchNum);
+
+            // int base_key = 0;
+            // loopFindNearKeyframesWithRespectTo(cureKeyframeCloud, loopKeyCur, 0, base_key); // giseop
+            // loopFindNearKeyframesWithRespectTo(prevKeyframeCloud, loopKeyPre, historyKeyframeSearchNum, base_key); // giseop
+
+            if (cureKeyframeCloud->size() < 300 || prevKeyframeCloud->size() < 1000)
+                return;
+            if (pubHistoryKeyFrames.getNumSubscribers() != 0)
+                publishCloud(pubHistoryKeyFrames, prevKeyframeCloud, timeLaserInfoStamp, odometryFrame);
+        }
+
+        // ICP Settings
+        static pcl::IterativeClosestPoint<PointType, PointType> icp;
+        icp.setMaxCorrespondenceDistance(150); // giseop , use a value can cover 2*historyKeyframeSearchNum range in meter
+        icp.setMaximumIterations(100);
+        icp.setTransformationEpsilon(1e-6);
+        icp.setEuclideanFitnessEpsilon(1e-6);
+        icp.setRANSACIterations(0);
+
+        // Align clouds
+        icp.setInputSource(cureKeyframeCloud);
+        icp.setInputTarget(prevKeyframeCloud);
+        pcl::PointCloud<PointType>::Ptr unused_result(new pcl::PointCloud<PointType>());
+        icp.align(*unused_result);
+        // giseop
+        // TODO icp align with initial
+
+        if (icp.hasConverged() == false || icp.getFitnessScore() > historyKeyframeFitnessScore) {
+            // std::cout << "ICP fitness test failed (" << icp.getFitnessScore() << " > " << historyKeyframeFitnessScore << "). Reject this SC loop." << std::endl;
+            return;
+        // } else {
+        //     std::cout << "ICP fitness test passed (" << icp.getFitnessScore() << " < " << historyKeyframeFitnessScore << "). Add this SC loop." << std::endl;
+        }
+
+        // publish corrected cloud
+        if (pubIcpKeyFrames.getNumSubscribers() != 0)
+        {
+            pcl::PointCloud<PointType>::Ptr closed_cloud(new pcl::PointCloud<PointType>());
+            pcl::transformPointCloud(*cureKeyframeCloud, *closed_cloud, icp.getFinalTransformation());
+            publishCloud(pubIcpKeyFrames, closed_cloud, timeLaserInfoStamp, odometryFrame);
+        }
+
+        // Get pose transformation
+        float x, y, z, roll, pitch, yaw;
+        Eigen::Affine3f correctionLidarFrame;
+        correctionLidarFrame = icp.getFinalTransformation();
+
+        // transform from world origin to wrong pose
+        Eigen::Affine3f tWrong = pclPointToAffine3f(copy_cloudKeyPoses6D->points[loopKeyCur]);
+        // transform from world origin to corrected pose
+        Eigen::Affine3f tCorrect = correctionLidarFrame * tWrong;// pre-multiplying -> successive rotation about a fixed frame
+        pcl::getTranslationAndEulerAngles (tCorrect, x, y, z, roll, pitch, yaw);
+        gtsam::Pose3 poseFrom = Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(x, y, z));
+        gtsam::Pose3 poseTo = pclPointTogtsamPose3(copy_cloudKeyPoses6D->points[loopKeyPre]);
+
+        gtsam::Vector Vector6(6);
+        float noiseScore = icp.getFitnessScore();
+        Vector6 << noiseScore, noiseScore, noiseScore, noiseScore, noiseScore, noiseScore;
+        noiseModel::Diagonal::shared_ptr constraintNoise = noiseModel::Diagonal::Variances(Vector6);
+
+        // Add pose constraint
+        mtx.lock();
+        loopIndexQueue.push_back(make_pair(loopKeyCur, loopKeyPre));
+        loopPoseQueue.push_back(poseFrom.between(poseTo));
+        loopNoiseQueue.push_back(constraintNoise);
+        mtx.unlock();
+
+        // add loop constriant
+        // loopIndexContainer[loopKeyCur] = loopKeyPre;
+        loopIndexContainer.insert(std::pair<int, int>(loopKeyCur, loopKeyPre)); // Scan Context for multimap
+
+        // // giseop
+        // pcl::getTranslationAndEulerAngles (correctionLidarFrame, x, y, z, roll, pitch, yaw);
+        // gtsam::Pose3 poseFrom = Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(x, y, z));
+        // gtsam::Pose3 poseTo = Pose3(Rot3::RzRyRx(0.0, 0.0, 0.0), Point3(0.0, 0.0, 0.0));
+
+        // // giseop, robust kernel for a SC loop
+        // float robustNoiseScore = 0.5; // constant is ok...
+        // gtsam::Vector robustNoiseVector6(6);
+        // robustNoiseVector6 << robustNoiseScore, robustNoiseScore, robustNoiseScore, robustNoiseScore, robustNoiseScore, robustNoiseScore;
+        // noiseModel::Base::shared_ptr robustConstraintNoise;
+        // robustConstraintNoise = gtsam::noiseModel::Robust::Create(
+        //     gtsam::noiseModel::mEstimator::Cauchy::Create(1), // optional: replacing Cauchy by DCS or GemanMcClure, but with a good front-end loop detector, Cauchy is empirically enough.
+        //     gtsam::noiseModel::Diagonal::Variances(robustNoiseVector6)
+        // ); // - checked it works. but with robust kernel, map modification may be delayed (i.e,. requires more true-positive loop factors)
+
+        // // Add pose constraint
+        // mtx.lock();
+        // loopIndexQueue.push_back(make_pair(loopKeyCur, loopKeyPre));
+        // loopPoseQueue.push_back(poseFrom.between(poseTo));
+        // loopNoiseQueue.push_back(robustConstraintNoise);
+        // mtx.unlock();
+
+        // // add loop constriant
+        // // loopIndexContainer[loopKeyCur] = loopKeyPre;
+        // loopIndexContainer.insert(std::pair<int, int>(loopKeyCur, loopKeyPre)); // Scan Context for multimap
+    } // performSCLoopClosure
 
     bool detectLoopClosureDistance(int *latestID, int *closestID)
     {
@@ -621,9 +992,15 @@ public:
         // find the closest history key frame
         std::vector<int> pointSearchIndLoop;
         std::vector<float> pointSearchSqDisLoop;
-        kdtreeHistoryKeyPoses->setInputCloud(copy_cloudKeyPoses3D);
-        kdtreeHistoryKeyPoses->radiusSearch(copy_cloudKeyPoses3D->back(), historyKeyframeSearchRadius, pointSearchIndLoop, pointSearchSqDisLoop, 0);
-        
+        // kdtreeHistoryKeyPoses->setInputCloud(copy_cloudKeyPoses3D);
+        // kdtreeHistoryKeyPoses->radiusSearch(copy_cloudKeyPoses3D->back(), historyKeyframeSearchRadius, pointSearchIndLoop, pointSearchSqDisLoop, 0);
+
+        for (int i = 0; i < (int)copy_cloudKeyPoses2D->size(); i++) // Scan Context
+            copy_cloudKeyPoses2D->points[i].z = 1.1; // to relieve the z-axis drift, 1.1 is just foo val
+
+        kdtreeHistoryKeyPoses->setInputCloud(copy_cloudKeyPoses2D); // Scan Context
+        kdtreeHistoryKeyPoses->radiusSearch(copy_cloudKeyPoses2D->back(), historyKeyframeSearchRadius, pointSearchIndLoop, pointSearchSqDisLoop, 0); // Scan Context
+
         for (int i = 0; i < (int)pointSearchIndLoop.size(); ++i)
         {
             int id = pointSearchIndLoop[i];
@@ -721,11 +1098,35 @@ public:
         *nearKeyframes = *cloud_temp;
     }
 
+    void loopFindNearKeyframesWithRespectTo(pcl::PointCloud<PointType>::Ptr& nearKeyframes, const int& key, const int& searchNum, const int _wrt_key)
+    {
+        // extract near keyframes
+        nearKeyframes->clear();
+        int cloudSize = copy_cloudKeyPoses6D->size();
+        for (int i = -searchNum; i <= searchNum; ++i)
+        {
+            int keyNear = key + i;
+            if (keyNear < 0 || keyNear >= cloudSize )
+                continue;
+            *nearKeyframes += *transformPointCloud(cornerCloudKeyFrames[keyNear], &copy_cloudKeyPoses6D->points[_wrt_key]);
+            *nearKeyframes += *transformPointCloud(surfCloudKeyFrames[keyNear],   &copy_cloudKeyPoses6D->points[_wrt_key]);
+        }
+
+        if (nearKeyframes->empty())
+            return;
+
+        // downsample near keyframes
+        pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());
+        downSizeFilterICP.setInputCloud(nearKeyframes);
+        downSizeFilterICP.filter(*cloud_temp);
+        *nearKeyframes = *cloud_temp;
+    }
+
     void visualizeLoopClosure()
     {
-        if (loopIndexContainer.empty())
-            return;
-        
+        // if (loopIndexContainer.empty())
+        //     return;
+
         visualization_msgs::MarkerArray markerArray;
         // loop nodes
         visualization_msgs::Marker markerNode;
@@ -791,7 +1192,7 @@ public:
 
         static Eigen::Affine3f lastImuTransformation;
         // initialization
-        if (cloudKeyPoses3D->points.empty())
+        if (cloudKeyPoses3D->points.empty() || initializedFlag == NonInitialized)
         {
             transformTobeMapped[0] = cloudInfo.imuRollInit;
             transformTobeMapped[1] = cloudInfo.imuPitchInit;
@@ -800,7 +1201,9 @@ public:
             if (!useImuHeadingInitialization)
                 transformTobeMapped[2] = 0;
 
-            lastImuTransformation = pcl::getTransformation(0, 0, 0, cloudInfo.imuRollInit, cloudInfo.imuPitchInit, cloudInfo.imuYawInit); // save imu before return;
+            // lastImuTransformation = pcl::getTransformation(0, 0, 0, cloudInfo.imuRollInit, cloudInfo.imuPitchInit, cloudInfo.imuYawInit); // save imu before return;
+            lastImuTransformation = pcl::getTransformation(initialPose[3], initialPose[4], initialPose[5], //
+                    cloudInfo.imuRollInit, cloudInfo.imuPitchInit, cloudInfo.imuYawInit); // save imu before return;
             return;
         }
 
@@ -824,7 +1227,9 @@ public:
 
                 lastImuPreTransformation = transBack;
 
-                lastImuTransformation = pcl::getTransformation(0, 0, 0, cloudInfo.imuRollInit, cloudInfo.imuPitchInit, cloudInfo.imuYawInit); // save imu before return;
+                // lastImuTransformation = pcl::getTransformation(0, 0, 0, cloudInfo.imuRollInit, cloudInfo.imuPitchInit, cloudInfo.imuYawInit); // save imu before return;
+                lastImuTransformation = pcl::getTransformation(initialPose[3], initialPose[4], initialPose[5], //
+                    cloudInfo.imuRollInit, cloudInfo.imuPitchInit, cloudInfo.imuYawInit); // save imu before return;
                 return;
             }
         }
@@ -832,7 +1237,9 @@ public:
         // use imu incremental estimation for pose guess (only rotation)
         if (cloudInfo.imuAvailable == true)
         {
-            Eigen::Affine3f transBack = pcl::getTransformation(0, 0, 0, cloudInfo.imuRollInit, cloudInfo.imuPitchInit, cloudInfo.imuYawInit);
+            // Eigen::Affine3f transBack = pcl::getTransformation(0, 0, 0, cloudInfo.imuRollInit, cloudInfo.imuPitchInit, cloudInfo.imuYawInit);
+            Eigen::Affine3f transBack = pcl::getTransformation(initialPose[3], initialPose[4], initialPose[5], //
+                    cloudInfo.imuRollInit, cloudInfo.imuPitchInit, cloudInfo.imuYawInit);
             Eigen::Affine3f transIncre = lastImuTransformation.inverse() * transBack;
 
             Eigen::Affine3f transTobe = trans2Affine3f(transformTobeMapped);
@@ -840,7 +1247,9 @@ public:
             pcl::getTranslationAndEulerAngles(transFinal, transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5], 
                                                           transformTobeMapped[0], transformTobeMapped[1], transformTobeMapped[2]);
 
-            lastImuTransformation = pcl::getTransformation(0, 0, 0, cloudInfo.imuRollInit, cloudInfo.imuPitchInit, cloudInfo.imuYawInit); // save imu before return;
+            lastImuTransformation = pcl::getTransformation(initialPose[3], initialPose[4], initialPose[5], //
+                    cloudInfo.imuRollInit, cloudInfo.imuPitchInit, cloudInfo.imuYawInit); // save imu before return;
+            //lastImuTransformation = pcl::getTransformation(0, 0, 0, cloudInfo.imuRollInit, cloudInfo.imuPitchInit, cloudInfo.imuYawInit); // save imu before return;
             return;
         }
     }
@@ -955,6 +1364,11 @@ public:
 
     void downsampleCurrentScan()
     {
+        // Scan Context
+        laserCloudRawDS->clear();
+        downSizeFilterSC.setInputCloud(laserCloudRaw);
+        downSizeFilterSC.filter(*laserCloudRawDS);
+
         // Downsample cloud from current scan
         laserCloudCornerLastDS->clear();
         downSizeFilterCorner.setInputCloud(laserCloudCornerLast);
@@ -1186,6 +1600,7 @@ public:
         cv::Mat matB(laserCloudSelNum, 1, CV_32F, cv::Scalar::all(0));
         cv::Mat matAtB(6, 1, CV_32F, cv::Scalar::all(0));
         cv::Mat matX(6, 1, CV_32F, cv::Scalar::all(0));
+        cv::Mat matP(6, 6, CV_32F, cv::Scalar::all(0)); // Scan Context
 
         PointType pointOri, coeff;
 
@@ -1355,7 +1770,10 @@ public:
     bool saveFrame()
     {
         if (cloudKeyPoses3D->points.empty())
+        {
+            lastSaveSecs = ros::Time::now().toSec();
             return true;
+        }
 
         if (sensor == SensorType::LIVOX)
         {
@@ -1370,11 +1788,25 @@ public:
         float x, y, z, roll, pitch, yaw;
         pcl::getTranslationAndEulerAngles(transBetween, x, y, z, roll, pitch, yaw);
 
+        if (saveLastPCD == true)
+        {
+            if (((float)(ros::Time::now().toSec() - lastSaveSecs) > 5.0) && waitSaveLastPCD == true)
+            {
+                // std::cout << "Time" << std::endl;
+                lastSaveSecs = ros::Time::now().toSec();
+                waitSaveLastPCD = false;
+                return true;
+            }
+        }
+
         if (abs(roll)  < surroundingkeyframeAddingAngleThreshold &&
             abs(pitch) < surroundingkeyframeAddingAngleThreshold && 
             abs(yaw)   < surroundingkeyframeAddingAngleThreshold &&
             sqrt(x*x + y*y + z*z) < surroundingkeyframeAddingDistThreshold)
             return false;
+
+        waitSaveLastPCD = true;
+        lastSaveSecs = ros::Time::now().toSec();
 
         return true;
     }
@@ -1383,7 +1815,7 @@ public:
     {
         if (cloudKeyPoses3D->points.empty())
         {
-            noiseModel::Diagonal::shared_ptr priorNoise = noiseModel::Diagonal::Variances((Vector(6) << 1e-2, 1e-2, M_PI*M_PI, 1e8, 1e8, 1e8).finished()); // rad*rad, meter*meter
+            noiseModel::Diagonal::shared_ptr priorNoise = noiseModel::Diagonal::Variances((Vector(6) << priorNoiseVector, priorNoiseVector, priorNoiseVector, priorNoiseVector, priorNoiseVector, priorNoiseVector).finished()); // rad*rad, meter*meter
             gtSAMgraph.add(PriorFactor<Pose3>(0, trans2gtsamPose(transformTobeMapped), priorNoise));
             initialEstimate.insert(0, trans2gtsamPose(transformTobeMapped));
         }else{
@@ -1485,7 +1917,8 @@ public:
             int indexFrom = loopIndexQueue[i].first;
             int indexTo = loopIndexQueue[i].second;
             gtsam::Pose3 poseBetween = loopPoseQueue[i];
-            gtsam::noiseModel::Diagonal::shared_ptr noiseBetween = loopNoiseQueue[i];
+            // gtsam::noiseModel::Diagonal::shared_ptr noiseBetween = loopNoiseQueue[i]; // original
+            auto noiseBetween = loopNoiseQueue[i]; // Scan Context for polymorhpism // shared_ptr<gtsam::noiseModel::Base>, typedef noiseModel::Base::shared_ptr gtsam::SharedNoiseModel
             gtSAMgraph.add(BetweenFactor<Pose3>(indexFrom, indexTo, poseBetween, noiseBetween));
         }
 
@@ -1525,6 +1958,9 @@ public:
             isam->update();
         }
 
+        if (saveGTSAM == true)
+                saveGraph();
+
         gtSAMgraph.resize(0);
         initialEstimate.clear();
 
@@ -1558,6 +1994,18 @@ public:
         // cout << "Pose covariance:" << endl;
         // cout << isam->marginalCovariance(isamCurrentEstimate.size()-1) << endl << endl;
         poseCovariance = isam->marginalCovariance(isamCurrentEstimate.size()-1);
+        if ((poseCovariance(3,3) < covarianceMedium) && (poseCovariance(4,4) < covarianceMedium))
+            feedback_quality = 1;
+        else
+            if ((poseCovariance(3,3) > covarianceHigh) || (poseCovariance(4,4) > covarianceHigh))
+                feedback_quality = 3;
+            else
+                feedback_quality = 2;
+        // cout << "****************************************************" << endl;
+        // cout << "Feedback Quality:" << endl;
+        // cout << poseCovariance(3,3) << endl;
+        // cout << poseCovariance(4,4) << endl;
+        // cout << feedback_quality << endl << endl;
 
         // save updated transform
         transformTobeMapped[0] = latestEstimate.rotation().roll();
@@ -1577,8 +2025,63 @@ public:
         cornerCloudKeyFrames.push_back(thisCornerKeyFrame);
         surfCloudKeyFrames.push_back(thisSurfKeyFrame);
 
+        // Scan Context loop detector - giseop
+        // - SINGLE_SCAN_FULL: using downsampled original point cloud (/full_cloud_projected + downsampling)
+        // - SINGLE_SCAN_FEAT: using surface feature as an input point cloud for scan context (2020.04.01: checked it works.)
+        // - MULTI_SCAN_FEAT: using NearKeyframes (because a MulRan scan does not have beyond region, so to solve this issue ... )
+        if( scdInput == SCInputType::SINGLE_SCAN_FULL ) {
+            pcl::PointCloud<PointType>::Ptr thisRawCloudKeyFrame(new pcl::PointCloud<PointType>());
+            pcl::copyPointCloud(*laserCloudRawDS,  *thisRawCloudKeyFrame);
+            scManager.makeAndSaveScancontextAndKeys(*thisRawCloudKeyFrame);
+        }  
+        else if (scdInput == SCInputType::SINGLE_SCAN_FEAT) {
+            pcl::PointCloud<PointType>::Ptr scanFeat(new pcl::PointCloud<PointType>());
+            *scanFeat += *thisCornerKeyFrame;
+            *scanFeat += *thisSurfKeyFrame;
+            scManager.makeAndSaveScancontextAndKeys(*scanFeat);
+        }
+        else if (scdInput == SCInputType::MULTI_SCAN_FEAT) {
+            pcl::PointCloud<PointType>::Ptr multiKeyFrameFeatureCloud(new pcl::PointCloud<PointType>());
+            loopFindNearKeyframes(multiKeyFrameFeatureCloud, cloudKeyPoses6D->size() - 1, historyKeyframeSearchNum);
+            scManager.makeAndSaveScancontextAndKeys(*multiKeyFrameFeatureCloud);
+        }
+
         // save path for visualization
         updatePath(thisPose6D);
+
+        // save keyframe cloud as file
+        pcl::PointCloud<PointType>::Ptr thisKeyFrameCloud(new pcl::PointCloud<PointType>());
+        if (savePCD)
+        {
+            cout << "****************************************************" << endl;
+            cout << "Saving Key Frame: " << cornerCloudKeyFrames.size() << endl;
+            if(saveRawCloud)
+            {
+                *thisKeyFrameCloud += *laserCloudRaw;
+            }
+            else
+            {
+                *thisKeyFrameCloud += *thisCornerKeyFrame;
+                *thisKeyFrameCloud += *thisSurfKeyFrame;
+            }
+            std::string curr_scd_node_idx = padZeros(cornerCloudKeyFrames.size() - 1);
+            pcl::io::savePCDFileBinary(saveNodePCDDirectory + curr_scd_node_idx + ".pcd", *thisKeyFrameCloud);
+            pcl::io::savePCDFileBinary(saveCornerKeyFramePCDDirectory + "C" + curr_scd_node_idx + ".pcd", *thisCornerKeyFrame);
+            pcl::io::savePCDFileBinary(saveSurfKeyFramePCDDirectory + "S" + curr_scd_node_idx + ".pcd", *thisSurfKeyFrame);
+
+            // save sc data
+            const auto& curr_scd = scManager.getConstRefRecentSCD();
+            curr_scd_node_idx = padZeros(scManager.polarcontexts_.size() - 1);
+            saveSCD(saveSCDDirectory + curr_scd_node_idx + ".scd", curr_scd);
+        }
+
+        // Save time stream
+        pgTimeSaveStream << laserCloudRawTime << std::endl;
+
+        // toSave = false;
+
+        // Add image service
+        // srvSaveImage.call(srvImage);
     }
 
     void correctPoses()
@@ -1761,14 +2264,949 @@ public:
             }
         }
     }
+
+    // Localization Functions
+
+    bool saveGraph()
+    {
+        string saveDirectory;
+        saveDirectory = saveMainDirectory + saveGTSAMDirectory;
+
+        // cout << "Save destination: " << saveDirectory << endl;
+        // create directory and remove old files;
+        int unused_g = system((std::string("exec rm -r ") + saveDirectory).c_str());
+        unused_g = system((std::string("mkdir -p ") + saveDirectory).c_str());
+        gtsam::writeG2o(isam->getFactorsUnsafe(), isam->calculateEstimate(), saveDirectory + "map.g2o");
+        ofstream os(saveDirectory + "map_graph.dot");
+        gtSAMgraph.saveGraph(os, isam->calculateEstimate());
+        cout << "****************************************************" << endl;
+        if (unused_g == 0)
+            cout << "Saving Factor Graph completed" << endl;
+
+        return true;
+    }
+
+    bool loadGraph()
+    {
+        NonlinearFactorGraph::shared_ptr graph;
+        Values::shared_ptr initial;
+        Key firstKey = 0;
+
+        string saveDirectory;
+
+        saveDirectory = saveMainDirectory + saveGTSAMDirectory;
+        // cout << "Save destination: " << saveDirectory << endl;
+        const char *saveDirectoryPath = saveDirectory.c_str();
+
+        if (!dirExists(saveDirectoryPath))
+        {
+            cout << "GTSAM directory Path failed. "<< endl;
+            return false;
+        }
+
+        boost::tie(graph, initial) = gtsam::readG2o(saveDirectory + "map.g2o", true);
+        gtSAMgraphFromFile = *graph;
+        initialEstimateFromFile = *initial;
+        // gtSAMgraphFromFile.print("GTSAM Graph:\n");
+        // initialEstimateFromFile.print("Initial estimate: ");
+
+        noiseModel::Diagonal::shared_ptr odometryNoise = //
+            noiseModel::Diagonal::Variances((Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
+
+        gtSAMgraphFromFile.add(PriorFactor<Pose3>(firstKey, initialEstimateFromFile.at<Pose3>(0), odometryNoise));
+
+        try {
+            // update iSAM
+            isam->update(gtSAMgraphFromFile, initialEstimateFromFile);
+
+            // Perform iSAM2 update on the loaded iSAM2 object
+            isam->update();
+            isam->update();
+            isam->update();
+            isam->update();
+            isam->update();
+
+            if (graphTest == true)
+            {
+                ofstream os(saveDirectory + "map_lio.dot");
+                gtSAMgraphFromFile.saveGraph(os, isam->calculateEstimate());
+                gtsam::writeG2o(isam->getFactorsUnsafe(), isam->calculateEstimate(), saveDirectory + "map1.g2o");
+            }
+
+            gtSAMgraphFromFile.resize(0);
+            initialEstimateFromFile.clear();
+
+        } catch (const gtsam::IndeterminantLinearSystemException& e) {
+            // Handle the exception
+            cout << "IndeterminantLinearSystemException: " << e.what() << endl;
+            // Additional error handling or recovery logic can be added here
+            return false;
+        }
+
+        isamCurrentEstimateFromFile = isam->calculateEstimate();
+        cout << "****************************************************" << endl;
+        std::cout << "iSAM estimate size: " << isamCurrentEstimateFromFile.size() << std::endl;
+
+        // //save key poses
+        // Pose3 latestEstimate;
+        // isamCurrentEstimateFromFile = isam->calculateEstimate();
+        // latestEstimate = isamCurrentEstimateFromFile.at<Pose3>(isamCurrentEstimateFromFile.size()-1);
+        // cout << "****************************************************" << endl;
+        // latestEstimate.print("Current estimate: ");
+
+        return true;
+    }
+
+    bool initNameFolder(string mapName)
+    {
+        if ((liosamMode == 0) || (liosamMode == 1)) {
+            saveMainDirectory = mapName + savePCDDirectory;
+        } else if (liosamMode == 2) {
+            saveMainDirectory = std::getenv("ROS_MAP_PATH") + std::string("/") + mapName + savePCDDirectory;
+        } else {
+            // ROS_ERROR("Repeat the message: wrong mode.");
+            cout << "Repeat the message: wrong mode." << endl;
+            return false;
+        }
+        cout << "Save destination: " << saveMainDirectory << endl;
+        return true;
+    }
+
+    bool initFolder()
+    {
+        int unused;
+        string saveDirectory;
+
+        saveDirectory = saveMainDirectory;
+        // cout << "Save destination: " << saveDirectory << endl;
+        const char *saveDirectoryPath = saveDirectory.c_str();
+
+        if (dirExists(saveDirectoryPath))
+        {
+            if (eraseLOAMFolder)
+            {
+                cout << "eraseLOAM param set to true - Removing LOAM Directory" << saveDirectory << endl;
+                unused = system((std::string("exec rm -r ") + saveDirectory).c_str());
+            }
+        }
+        else
+        {
+            cout << "No LOAM directory Found - Creating LOAM Directory" << saveDirectory << endl;
+		    unused = system((std::string("mkdir ") + saveDirectory).c_str());
+        }
+
+        saveSCDDirectory = saveDirectory + "SCDs/"; // SCD: scan context descriptor
+        unused = system((std::string("mkdir -p ") + saveSCDDirectory).c_str());
+
+        saveNodePCDDirectory = saveDirectory + "Scans/";
+        unused = system((std::string("mkdir -p ") + saveNodePCDDirectory).c_str());
+
+        saveCornerKeyFramePCDDirectory = saveNodePCDDirectory + "CornerFrames/";
+        unused = system((std::string("mkdir -p ") + saveCornerKeyFramePCDDirectory).c_str());
+
+        saveSurfKeyFramePCDDirectory = saveNodePCDDirectory + "SurfFrames/";
+        unused = system((std::string("mkdir -p ") + saveSurfKeyFramePCDDirectory).c_str());
+
+        pgTimeSaveStream = std::fstream(saveDirectory + "times.txt", std::fstream::out); pgTimeSaveStream.precision(dbl::max_digits10);
+
+        cout << "****************************************************" << endl;
+        if (unused == 0)
+            cout << "Folders created." << endl;
+
+        return true;
+    }
+
+    bool dirExists(const char *path)
+    {
+	    struct stat info;
+
+	    if(stat( path, &info ) != 0)
+		    return false;
+	    else if(info.st_mode & S_IFDIR)
+		    return true;
+	    else
+		    return false;
+    }
+
+    bool cloudGlobalLoad()
+    {
+        string saveDirectory;
+
+        saveDirectory = saveMainDirectory;
+        // cout << "Save destination: " << saveDirectory << endl;
+        const char *saveDirectoryPath = saveDirectory.c_str();
+
+        if (!dirExists(saveDirectoryPath))
+        {
+            cout << "PCD directory Path failed. "<< endl;
+            return false;
+        }
+
+        pcl::io::loadPCDFile(saveDirectory + "GlobalMap.pcd", *cloudGlobalMap);
+
+        pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());
+        downSizeFilterICP.setInputCloud(cloudGlobalMap);
+        downSizeFilterICP.filter(*cloud_temp);
+        *cloudGlobalMapDS = *cloud_temp;
+
+        cout << "****************************************************" << endl;
+        cout << "Loading Global Map" << endl;
+        cout << "The size of global cloud: " << cloudGlobalMap->points.size() << endl;
+        cout << "The size of global map after filter: " << cloudGlobalMapDS->points.size() << endl;
+
+        return true;
+    }
+
+    void publishMap()
+    {
+        sensor_msgs::PointCloud2 point_cloud_msg;
+        if (globalMapVisualizationFileFilter == true)
+        {
+            pcl::toROSMsg(*cloudGlobalMapDS, point_cloud_msg);
+        }
+        else
+        {
+            pcl::toROSMsg(*cloudGlobalMap, point_cloud_msg);
+        }
+        point_cloud_msg.header.stamp = ros::Time::now();
+        point_cloud_msg.header.frame_id = "map";
+        pubLaserCloudSurround.publish(point_cloud_msg);
+    }
+
+    int loadFiles()
+    {
+        string saveDirectory;
+
+        saveDirectory = saveMainDirectory;
+        // saveDirectory = std::getenv("HOME") + savePCDDirectory;
+        // cout << "Save destination: " << saveDirectory << endl;
+
+        if (pcl::io::loadPCDFile<PointType>(saveDirectory + "trajectory.pcd", *cloudKeyPoses3DFromFile) == -1)
+        {
+            PCL_ERROR("Couldn't read file trajectory.pcd \n No cloudKeyPoses3D");
+            return (-1);
+        }
+
+        if (pcl::io::loadPCDFile<PointTypePose>(saveDirectory + "transformations.pcd", *cloudKeyPoses6DFromFile) == -1)
+        {
+            PCL_ERROR("Couldn't read file transformations.pcd \n No cloudKeyPoses6D");
+            return (-1);
+        }
+
+        cout << "****************************************************" << endl;
+        std::cout << " **** Points (cloudKeyPoses3DFromFile): " << cloudKeyPoses3DFromFile->points.size() << std::endl;
+        std::cout << " **** Points (cloudKeyPoses6DFromFile): " << cloudKeyPoses6DFromFile->points.size() << std::endl;
+        // std::cout << "Points (cloudKeyPoses3DFromFile[0].x): " << (*cloudKeyPoses3DFromFile)[0].x << std::endl;
+        // std::cout << "Points (cloudKeyPoses3DFromFile[0].y): " << (*cloudKeyPoses3DFromFile)[0].y << std::endl;
+        // std::cout << "Points (cloudKeyPoses3DFromFile[0].z): " << (*cloudKeyPoses3DFromFile)[0].z << std::endl;
+
+        saveNodePCDDirectory = saveDirectory + "Scans/";
+        saveCornerKeyFramePCDDirectory = saveNodePCDDirectory + "CornerFrames/";
+
+        for (int i = 0; i < (int)cloudKeyPoses3DFromFile->points.size(); i++)
+        {
+            std::string curr_scd_node_idx = padZeros(i);
+            std::string pathString = saveCornerKeyFramePCDDirectory + "C" + curr_scd_node_idx + ".pcd";
+            pcl::PointCloud<PointType>::Ptr thisCornerKeyFrameCloud(new pcl::PointCloud<PointType>());
+
+            if (pcl::io::loadPCDFile<PointType> (pathString, *thisCornerKeyFrameCloud) == -1)
+            {
+                PCL_ERROR ("Couldn't read file cloudCorner.pcd \n");
+                return (-1);
+            }
+            else
+            {
+                cornerCloudKeyFramesFromFile.push_back(thisCornerKeyFrameCloud);
+            }
+        }
+
+        cout << " **** Loading Corner Key Frames: "<< cornerCloudKeyFramesFromFile.size() << endl;
+
+        saveNodePCDDirectory = saveDirectory + "Scans/";
+        saveSurfKeyFramePCDDirectory = saveNodePCDDirectory + "SurfFrames/";
+
+        for (int i = 0; i < (int)cloudKeyPoses3DFromFile->points.size(); i++)
+        {
+            std::string curr_scd_node_idx = padZeros(i);
+            std::string pathString = saveSurfKeyFramePCDDirectory + "S" + curr_scd_node_idx + ".pcd";
+            pcl::PointCloud<PointType>::Ptr thisCornerKeyFrameCloud(new pcl::PointCloud<PointType>());
+
+            if (pcl::io::loadPCDFile<PointType> (pathString, *thisCornerKeyFrameCloud) == -1)
+            {
+                PCL_ERROR ("Couldn't read file cloudSurf.pcd \n");
+                return (-1);
+            }
+            else
+            {
+                surfCloudKeyFramesFromFile.push_back(thisCornerKeyFrameCloud);
+            }
+        }
+
+        cout << " **** Loading Surf Key Frames: "<< surfCloudKeyFramesFromFile.size() << endl;
+
+        saveSCDDirectory = saveDirectory + "SCDs/";
+
+        for (int i = 0; i < (int)cloudKeyPoses3DFromFile->points.size(); i++)
+        {
+            std::string curr_scd_node_idx = padZeros(i);
+            std::string pathString = saveSCDDirectory + curr_scd_node_idx + ".scd";
+
+            polarcontexts_FromFile.push_back(loadSCD(pathString, scManager.PC_NUM_RING, scManager.PC_NUM_SECTOR));
+            scManager.loadMakeSaveScancontextAndKeys(polarcontexts_FromFile.back());
+        }
+
+        cout << " **** Loading SCD with " << scManager.PC_NUM_RING << " rings and " << scManager.PC_NUM_SECTOR << " sectors: : "<< scManager.polarcontexts_.size() << endl;
+
+        if (buildConfusionMatrix == true)
+        {
+            saveDirectory = saveMainDirectory + savePCDDirectory_Q;
+
+            if (pcl::io::loadPCDFile<PointType>(saveDirectory + "trajectory.pcd", *cloudKeyPoses3D_Q_FromFile) == -1)
+            {
+                PCL_ERROR("Couldn't read file trajectory.pcd \n No cloudKeyPoses3D");
+                return (-1);
+            }
+            saveSCDDirectory = saveDirectory + "SCDs/";
+
+            for (int i = 0; i < (int)cloudKeyPoses3D_Q_FromFile->points.size(); i++)
+            {
+                std::string curr_scd_node_idx = padZeros(i);
+                std::string pathString = saveSCDDirectory + curr_scd_node_idx + ".scd";
+
+                polarcontexts_Q_FromFile.push_back(loadSCD(pathString, scManager.PC_NUM_RING, scManager.PC_NUM_SECTOR));
+            }
+
+            cout << " **** Loading SCD Query with " << scManager.PC_NUM_RING << " rings and " << scManager.PC_NUM_SECTOR << " sectors: : "<< polarcontexts_Q_FromFile.size() << endl;
+        }
+
+        return 0;
+    }
+
+    bool performInitPCD()
+    {
+        double auxFitnessScore[2] = {0, 100}; // {node, minimum_fitness_score}
+        float fitnessScoreVector[cornerCloudKeyFrames.size()];
+        std::fill_n(fitnessScoreVector, cornerCloudKeyFrames.size(), 0.0);
+
+        pcl::PointCloud<PointType>::Ptr laserCloudIn(new pcl::PointCloud<PointType>());
+        mtx_general.lock();
+        *laserCloudIn += *cloudScanForInitialize;
+        mtx_general.unlock();
+
+        if (laserCloudIn->points.size() == 0)
+            return false;
+        // cloudScanForInitialize->clear();
+        cout << "****************************************************" << endl;
+        std::cout << "Perform Init PCD " << std::endl;
+        std::cout << "The size of incoming lasercloud: " << laserCloudIn->points.size() << std::endl;
+
+        // fitnessScoreSaveStream = std::fstream(std::getenv("HOME") + savePCDDirectory + "fitness.txt", std::fstream::out);
+        fitnessScoreSaveStream = std::fstream(saveMainDirectory + "fitness.txt", std::fstream::out);
+
+        // ICP Settings
+        static pcl::IterativeClosestPoint<PointType, PointType> icp;
+        icp.setMaxCorrespondenceDistance(historyKeyframeSearchRadius*2);
+        icp.setMaximumIterations(100);
+        icp.setTransformationEpsilon(1e-6);
+        icp.setEuclideanFitnessEpsilon(1e-6);
+        icp.setRANSACIterations(0);
+
+        for (int indexInitial : node_vector(cornerCloudKeyFrames.size()-1))
+        {
+            if (indexInitial > (int)(cornerCloudKeyFrames.size()-1))
+                break;
+
+            // std::cout << "indexInitial: " << indexInitial << std::endl;
+
+            pcl::PointCloud<PointType>::Ptr framefrom(new pcl::PointCloud<PointType>());
+            *framefrom += *cornerCloudKeyFrames[indexInitial];
+            *framefrom += *surfCloudKeyFrames[indexInitial];
+
+            // Align clouds
+            icp.setInputSource(laserCloudIn);
+            icp.setInputTarget(framefrom);
+            pcl::PointCloud<PointType>::Ptr unused_result(new pcl::PointCloud<PointType>());
+            icp.align(*unused_result);
+
+            // if (icp.hasConverged() == false)
+            // {
+            //     std::cout << "Initial ICP fitness test failed for node "<< indexInitial << " (" << icp.getFitnessScore() << ")." << std::endl;
+            //     std::cout << "/**********************************************************************/" << std::endl;
+            // }
+            // else
+            // {
+            //     std::cout << "Initial ICP fitness test passed for node "<< indexInitial << " (" << icp.getFitnessScore() << ")." << std::endl;
+            //     std::cout << "/**********************************************************************/" << std::endl;
+            // }
+
+            if ((icp.getFitnessScore() < auxFitnessScore[1]) && (icp.getFitnessScore() > 0.00001))
+            {
+                auxFitnessScore[0] = indexInitial;
+                auxFitnessScore[1] = icp.getFitnessScore();
+            }
+
+            fitnessScoreVector[indexInitial] = icp.getFitnessScore();
+
+            if (auxFitnessScore[1] <= pcdLocalizationThreshold)
+                break;
+        }
+
+        cout << "The Minimum Fitness Score is " << auxFitnessScore[1] << " and the initial node is : " << auxFitnessScore[0] <<  endl;
+
+        if (auxFitnessScore[1] > 1000.0)
+            return false;
+
+        std::stringstream ss;
+        for(size_t i = 0; i < cornerCloudKeyFrames.size(); ++i)
+        {
+            if(i != 0)
+                ss << ",";
+            ss << fitnessScoreVector[i];
+        }
+        std::string s = ss.str();
+        fitnessScoreSaveStream << s << std::endl;
+
+        initialPose[3] = (*cloudKeyPoses6D)[auxFitnessScore[0]].x;
+        initialPose[4] = (*cloudKeyPoses6D)[auxFitnessScore[0]].y;
+        initialPose[5] = (*cloudKeyPoses6D)[auxFitnessScore[0]].z;
+        initialPose[0] = (*cloudKeyPoses6D)[auxFitnessScore[0]].roll;
+        initialPose[1] = (*cloudKeyPoses6D)[auxFitnessScore[0]].pitch;
+        initialPose[2] = (*cloudKeyPoses6D)[auxFitnessScore[0]].yaw;
+
+        cout << initialPose[3] << endl;
+        cout << initialPose[4] << endl;
+        cout << initialPose[5] << endl;
+        cout << initialPose[0] << endl;
+        cout << initialPose[1] << endl;
+        cout << initialPose[2] << endl;
+
+        return true;
+    }
+
+    bool performInitSCD()
+    {
+        double auxSimilarityScore[2] = {0, 1};
+        float similarityScoreVector[polarcontexts_FromFile.size()];
+        std::fill_n(similarityScoreVector, polarcontexts_FromFile.size(), 0.0);
+
+        // similarityScoreSaveStream = std::fstream(std::getenv("HOME") + savePCDDirectory + "similarity.txt", std::fstream::out);
+        similarityScoreSaveStream = std::fstream(saveMainDirectory + "similarity.txt", std::fstream::out);
+
+        // pcl::PointCloud<PointType>::Ptr laserCloudIn(new pcl::PointCloud<PointType>());
+        // mtx_general.lock();
+        // //*laserCloudIn += *laserCloudRawDS;
+        // *laserCloudIn += *laserCloudSurfLastDS;
+        // mtx_general.unlock();
+
+        // if (laserCloudIn->points.size() == 0)
+        //     return false;
+        // cloudScanForInitialize->clear();
+        //std::cout << "performInitSCD " << std::endl;
+        //std::cout << "the size of incoming lasercloud: " << laserCloudIn->points.size() << std::endl;
+
+        cout << "****************************************************" << endl;
+        std::cout << "Perform Init SCD " << std::endl;
+
+        // save all the received edge and surf points
+        // pcl::PointCloud<PointType>::Ptr thisCornerKeyFrame(new pcl::PointCloud<PointType>());
+        // pcl::PointCloud<PointType>::Ptr thisSurfKeyFrame(new pcl::PointCloud<PointType>());
+        // pcl::copyPointCloud(*laserCloudCornerLastDS,  *thisCornerKeyFrame);
+        // pcl::copyPointCloud(*laserCloudSurfLastDS,    *thisSurfKeyFrame);
+
+        // pcl::PointCloud<PointType>::Ptr laserCloudIn(new pcl::PointCloud<PointType>());
+
+        // // - SINGLE_SCAN_FULL: using downsampled original point cloud (/full_cloud_projected + downsampling)
+        // // - SINGLE_SCAN_FEAT: using surface feature as an input point cloud for scan context (2020.04.01: checked it works.)
+        // // - MULTI_SCAN_FEAT: using NearKeyframes (because a MulRan scan does not have beyond region, so to solve this issue ... )
+
+        // if( scdInput == SCInputType::SINGLE_SCAN_FULL ) 
+        // {
+        //     std::cout << "Scan Type Mode: single scan" << std::endl;
+        //     pcl::copyPointCloud(*laserCloudRawDS,  *laserCloudIn);
+        // }  
+        // else if (scdInput == SCInputType::SINGLE_SCAN_FEAT) {
+        //     std::cout << "Scan Type Mode: single feature" << std::endl;
+        //     mtx_general.lock();
+        //     *laserCloudIn += *thisCornerKeyFrame;
+        //     *laserCloudIn += *thisSurfKeyFrame;
+        //     mtx_general.unlock();
+        // }
+        // else if (scdInput == SCInputType::MULTI_SCAN_FEAT) {
+        //     std::cout << "Scan Type Mode: Multi feature" << std::endl;
+        //     mtx_general.lock();
+        //     *laserCloudIn += *thisCornerKeyFrame;
+        //     *laserCloudIn += *thisSurfKeyFrame;
+        //     mtx_general.unlock();
+        // }
+
+        // scManager.makeAndSaveScancontextAndKeys(*laserCloudIn);
+        std::cout << "The size of incoming SCD data: " << scManager.polarcontexts_.size() << std::endl;
+
+        //std::cout << "SC: " << scManager.polarcontexts_ << std::endl;
+
+        auto curr_desc = scManager.polarcontexts_.back();
+
+        for (int indexInitial : node_vector(polarcontexts_FromFile.size()-1))
+        {
+            if (indexInitial > (int)(polarcontexts_FromFile.size()-1))
+                break;
+            std::pair<double, int> sc_dist_result = //
+                scManager.distanceBtnScanContext(curr_desc, polarcontexts_FromFile.at(indexInitial));
+            // cout << indexInitial << ": "<< sc_dist_result.first << endl;
+
+            if ((sc_dist_result.first < auxSimilarityScore[1]))
+            {
+                auxSimilarityScore[0] = indexInitial;
+                auxSimilarityScore[1] = sc_dist_result.first;
+            }
+        }
+
+        cout << "The Minimum is " << auxSimilarityScore[1] << " and the initial node is : " << auxSimilarityScore[0] <<  endl;
+
+        std::stringstream ss_sim;
+        for(size_t i = 0; i < cornerCloudKeyFrames.size(); ++i)
+        {
+            if(i != 0)
+                ss_sim << ",";
+            ss_sim << auxSimilarityScore[i];
+        }
+        std::string s_sim = ss_sim.str();
+        similarityScoreSaveStream << s_sim << std::endl;
+
+        initialPose[3] = (*cloudKeyPoses6D)[auxSimilarityScore[0]].x;
+        initialPose[4] = (*cloudKeyPoses6D)[auxSimilarityScore[0]].y;
+        initialPose[5] = (*cloudKeyPoses6D)[auxSimilarityScore[0]].z;
+        initialPose[0] = (*cloudKeyPoses6D)[auxSimilarityScore[0]].roll;
+        initialPose[1] = (*cloudKeyPoses6D)[auxSimilarityScore[0]].pitch;
+        initialPose[2] = (*cloudKeyPoses6D)[auxSimilarityScore[0]].yaw;
+
+        cout << initialPose[3] << endl;
+        cout << initialPose[4] << endl;
+        cout << initialPose[5] << endl;
+        cout << initialPose[0] << endl;
+        cout << initialPose[1] << endl;
+        cout << initialPose[2] << endl;
+
+        return true;
+    }
+
+    void confusionMatrix()
+    {
+        // Confusion Matrix
+        cout << "****************************************************" << endl;
+        std::cout << "Confusion Matrix: start" << std::endl;
+
+        cmScoreSaveStream = std::fstream(std::getenv("HOME") + savePCDDirectory + "scores.txt", std::fstream::out);
+
+        std::stringstream ss;
+        for (int dataIndex : node_vector(polarcontexts_FromFile.size()-1) )
+        {
+            if (dataIndex > (int)(polarcontexts_FromFile.size()-1))
+                break;
+
+            for (int queryIndex : node_vector(polarcontexts_Q_FromFile.size()-1))
+            {
+                if (queryIndex > (int)(polarcontexts_Q_FromFile.size()-1))
+                    break;
+                std::pair<double, int> sc_dist_result = //
+                    scManager.distanceBtnScanContext(polarcontexts_FromFile.at(dataIndex), polarcontexts_Q_FromFile.at(queryIndex));
+                if(queryIndex != 0)
+                    ss << ",";
+                ss << sc_dist_result.first;
+            }
+            ss << std::endl;
+        }
+        std::string s = ss.str();
+        cmScoreSaveStream << s << std::endl;
+
+        std::cout << "Confusion Matrix: end" << std::endl;
+    }
+
+    std::vector<int> node_vector(int sizeFrames)
+    {
+        std::vector<int> nodes;
+        int indexInitial;
+        // int sizeFrames = cornerCloudKeyFrames.size()-1;
+
+        if (icpLocalizationAscendingOrder == true)
+        {
+            for (indexInitial = 0 ; indexInitial <= sizeFrames; indexInitial += icpLocalizationStep)
+            {
+                nodes.push_back(indexInitial);
+            }
+        }
+        else
+        {
+            for (indexInitial = sizeFrames ; indexInitial >= 0; indexInitial -= icpLocalizationStep)
+            {
+                nodes.push_back(indexInitial);
+            }
+        }
+        return nodes;
+    }
+
+    void initLocalization()
+    {
+        if (cloudScanForInitialize->points.size() == 0)
+        {
+            downsampleCurrentScan();
+
+            mtx_general.lock();
+            *cloudScanForInitialize += *laserCloudCornerLastDS;
+            *cloudScanForInitialize += *laserCloudSurfLastDS;
+            mtx_general.unlock();
+
+            // SCD 
+            pcl::PointCloud<PointType>::Ptr laserCloudIn(new pcl::PointCloud<PointType>());
+            if( scdInput == SCInputType::SINGLE_SCAN_FULL ) 
+            {
+                std::cout << "Scan Type Mode: single scan" << std::endl;
+                mtx_general.lock();
+                *laserCloudIn = *laserCloudRawDS;
+                mtx_general.unlock();
+            }  
+            else if (scdInput == SCInputType::SINGLE_SCAN_FEAT) {
+                std::cout << "Scan Type Mode: single feature" << std::endl;
+                mtx_general.lock();
+                *laserCloudIn += *laserCloudCornerLastDS;
+                *laserCloudIn += *laserCloudSurfLastDS;
+                mtx_general.unlock();
+            }
+            else if (scdInput == SCInputType::MULTI_SCAN_FEAT) {
+                std::cout << "Scan Type Mode: Multi feature" << std::endl;
+                mtx_general.lock();
+                *laserCloudIn += *laserCloudCornerLastDS;
+                *laserCloudIn += *laserCloudSurfLastDS;
+                mtx_general.unlock();
+            }
+            scManager.makeAndSaveScancontextAndKeys(*laserCloudIn);
+
+            // Preliminary ICP - Not implemented
+            if (icpLocalizationPreliminary == true)
+            {
+                auto begin_00 = std::chrono::high_resolution_clock::now();
+                ICPLocalizeInitialize();
+                auto end_00 = std::chrono::high_resolution_clock::now();
+                auto elapsed_00  = std::chrono::duration_cast<std::chrono::nanoseconds>(end_00 - begin_00);
+                printf("Time measured (PRE): %.9f seconds.\n", elapsed_00.count() * 1e-9);
+            }
+
+            // Scan Context Descriptor
+            if (scdInitialLocalization == true)
+            {
+                auto begin_01 = std::chrono::high_resolution_clock::now();
+                if (!performInitSCD())
+                {
+                    cloudScanForInitialize->clear();
+                    return;
+                }
+                auto end_01 = std::chrono::high_resolution_clock::now();
+                auto elapsed_01  = std::chrono::duration_cast<std::chrono::nanoseconds>(end_01 - begin_01);
+                printf("Time measured (SCD): %.9f seconds.\n", elapsed_01.count() * 1e-9);
+            }
+
+            // Point Cloud ICP
+            if (pcdInitialLocalization == true)
+            {
+                auto begin = std::chrono::high_resolution_clock::now();
+                if (!performInitPCD())
+                {
+                    cloudScanForInitialize->clear();
+                    return;
+                }
+                auto end = std::chrono::high_resolution_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin);
+                printf("Time measured (PCD): %.9f seconds.\n", elapsed.count() * 1e-9);
+            }
+            
+            // Debug data
+            if (buildConfusionMatrix)
+            {
+                confusionMatrix();
+                while(1);
+            }
+                
+            updateInitialGuess();
+
+            transformTobeMapped[3] = initialPose[3];
+            transformTobeMapped[4] = initialPose[4];
+            transformTobeMapped[5] = initialPose[5];
+
+            // odom factor
+            noiseModel::Diagonal::shared_ptr odometryNoise = noiseModel::Diagonal::Variances((Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
+            gtsam::Pose3 poseFrom = pclPointTogtsamPose3(cloudKeyPoses6D->points.back());
+            gtsam::Pose3 poseTo   = trans2gtsamPose(initialPose);
+            gtSAMgraph.add(BetweenFactor<Pose3>(cloudKeyPoses3D->size()-1, cloudKeyPoses3D->size(), poseFrom.between(poseTo), odometryNoise));
+            initialEstimate.insert(cloudKeyPoses3D->size(), trans2gtsamPose(initialPose));
+
+            cout << "****************************************************" << endl;
+            gtSAMgraph.print("GTSAM Graph:\n");
+
+            // update iSAM
+            isam->update(gtSAMgraph, initialEstimate);
+            isam->update();
+            isam->update();
+            isam->update();
+            isam->update();
+            isam->update();
+
+            gtSAMgraph.resize(0);
+            initialEstimate.clear();
+
+            //save key poses
+            PointType thisPose3D;
+            PointTypePose thisPose6D;
+            Pose3 latestEstimate;
+
+            isamCurrentEstimate = isam->calculateEstimate();
+            latestEstimate = isamCurrentEstimate.at<Pose3>(isamCurrentEstimate.size()-1);
+            cout << "****************************************************" << endl;
+            latestEstimate.print("Current estimate: ");
+
+            thisPose3D.x = latestEstimate.translation().x();
+            thisPose3D.y = latestEstimate.translation().y();
+            thisPose3D.z = latestEstimate.translation().z();
+            thisPose3D.intensity = cloudKeyPoses3D->size(); // this can be used as index
+            cloudKeyPoses3D->push_back(thisPose3D);
+
+            thisPose6D.x = thisPose3D.x;
+            thisPose6D.y = thisPose3D.y;
+            thisPose6D.z = thisPose3D.z;
+            thisPose6D.intensity = thisPose3D.intensity ; // this can be used as index
+            thisPose6D.roll  = latestEstimate.rotation().roll();
+            thisPose6D.pitch = latestEstimate.rotation().pitch();
+            thisPose6D.yaw   = latestEstimate.rotation().yaw();
+            thisPose6D.time = timeLaserInfoCur;
+            cloudKeyPoses6D->push_back(thisPose6D);
+
+            // cout << "****************************************************" << endl;
+            // cout << "Pose covariance:" << endl;
+            // cout << isam->marginalCovariance(isamCurrentEstimate.size()-1) << endl << endl;
+            poseCovariance = isam->marginalCovariance(isamCurrentEstimate.size()-1);
+
+            // save updated transform
+            transformTobeMapped[0] = latestEstimate.rotation().roll();
+            transformTobeMapped[1] = latestEstimate.rotation().pitch();
+            transformTobeMapped[2] = latestEstimate.rotation().yaw();
+            transformTobeMapped[3] = latestEstimate.translation().x();
+            transformTobeMapped[4] = latestEstimate.translation().y();
+            transformTobeMapped[5] = latestEstimate.translation().z();
+
+            // save all the received edge and surf points
+            pcl::PointCloud<PointType>::Ptr thisCornerKeyFrame(new pcl::PointCloud<PointType>());
+            pcl::PointCloud<PointType>::Ptr thisSurfKeyFrame(new pcl::PointCloud<PointType>());
+            pcl::copyPointCloud(*laserCloudCornerLastDS,  *thisCornerKeyFrame);
+            pcl::copyPointCloud(*laserCloudSurfLastDS,    *thisSurfKeyFrame);
+
+            // save key frame cloud
+            cornerCloudKeyFrames.push_back(thisCornerKeyFrame);
+            surfCloudKeyFrames.push_back(thisSurfKeyFrame);
+
+            cout << "****************************************************" << endl;
+            cout << "cornerCloudKeyFrames size: " << cornerCloudKeyFrames.size() << endl;
+            cout << "surfCloudKeyFrames size: " << surfCloudKeyFrames.size() << endl;
+
+            cout << "Points (cloudKeyPoses3D): " << cloudKeyPoses3D->points.size() << endl;
+            cout << "Points (cloudKeyPoses6D): " << cloudKeyPoses6D->points.size() << endl;
+
+            // save path for visualization
+            updatePath(thisPose6D);
+
+            correctPoses();
+
+            publishOdometry();
+
+            publishFrames();
+
+            if (savePCD)
+            {
+                // save keyframe cloud as file
+                pcl::PointCloud<PointType>::Ptr thisKeyFrameCloud(new pcl::PointCloud<PointType>());
+
+                cout << "****************************************************" << endl;
+                cout << "Saving Key Frame: " << cornerCloudKeyFrames.size() << endl;
+                if(saveRawCloud)
+                {
+                    *thisKeyFrameCloud += *laserCloudRaw;
+                }
+                else
+                {
+                    *thisKeyFrameCloud += *thisCornerKeyFrame;
+                    *thisKeyFrameCloud += *thisSurfKeyFrame;
+                }
+                std::string curr_pcd_node_idx = padZeros(cornerCloudKeyFrames.size() - 1);
+                pcl::io::savePCDFileBinary(saveNodePCDDirectory + curr_pcd_node_idx + ".pcd", *thisKeyFrameCloud);
+                pcl::io::savePCDFileBinary(saveCornerKeyFramePCDDirectory + "C" + curr_pcd_node_idx + ".pcd", *thisCornerKeyFrame);
+                pcl::io::savePCDFileBinary(saveSurfKeyFramePCDDirectory + "S" + curr_pcd_node_idx + ".pcd", *thisSurfKeyFrame);
+
+                // save sc data
+                const auto& curr_scd = scManager.getConstRefRecentSCD();
+                std::string curr_scd_node_idx = padZeros(scManager.polarcontexts_.size() - 1);
+                saveSCD(saveSCDDirectory + curr_scd_node_idx + ".scd", curr_scd);
+
+            }
+
+            initializedFlag = Initialized;
+        }
+    }
+
+    void ICPLocalizeInitialize()
+    {
+        pcl::PointCloud<PointType>::Ptr laserCloudIn(new pcl::PointCloud<PointType>());
+
+        mtx_general.lock();
+        *laserCloudIn += *cloudScanForInitialize;
+        mtx_general.unlock();
+
+        if (laserCloudIn->points.size() == 0)
+            return;
+
+        pcl::NormalDistributionsTransform<PointType, PointType> ndt;
+        ndt.setTransformationEpsilon(0.01);
+        ndt.setResolution(1.0);
+
+        pcl::IterativeClosestPoint<PointType, PointType> icp;
+        // Set the maximum distance threshold between two correspondent points in source <-> target.
+        // If the distance is larger than this threshold, the points will be ignored in the alignment process.
+        icp.setMaxCorrespondenceDistance(setMaxCorrespondenceDistance);
+        // Set the maximum number of iterations the internal optimization should run for.
+        icp.setMaximumIterations(setMaximumIterations);
+        // The maximum difference between two consecutive transformations in order to consider convergence (user defined)
+        icp.setTransformationEpsilon(setTransformationEpsilon);
+        // Set the maximum allowed Euclidean error between two consecutive steps in the ICP loop, before the algorithm is considered to have converged.
+        // The error is estimated as the sum of the differences between correspondences in an Euclidean sense, divided by the number of correspondences.
+        icp.setEuclideanFitnessEpsilon(setEuclideanFitnessEpsilon);
+        // Set the number of iterations RANSAC should run for.
+        icp.setRANSACIterations(setRANSACIterations);
+
+        ndt.setInputSource(laserCloudIn);
+        ndt.setInputTarget(cloudGlobalMapDS);
+        pcl::PointCloud<PointType>::Ptr unused_result_0(new pcl::PointCloud<PointType>());
+
+        PointTypePose thisPose6DInWorld = trans2PointTypePose(transformInTheWorld);
+        Eigen::Affine3f T_thisPose6DInWorld = pclPointToAffine3f(thisPose6DInWorld);
+        ndt.align(*unused_result_0, T_thisPose6DInWorld.matrix());
+
+        // use the outcome of ndt as the initial guess for ICP
+        icp.setInputSource(laserCloudIn);
+        icp.setInputTarget(cloudGlobalMapDS);
+        pcl::PointCloud<PointType>::Ptr unused_result(new pcl::PointCloud<PointType>());
+        icp.align(*unused_result, ndt.getFinalTransformation());
+
+        std::cout << "the icp score in initializing process is: " << icp.getFitnessScore() << std::endl;
+        std::cout << "the pose after initializing process is: " << icp.getFinalTransformation() << std::endl;
+    }
 };
 
+// Constructor of the LIO-SAM Server
+ExecuteLioSamServer::ExecuteLioSamServer(ros::NodeHandle* node_handler, std::string action_server_name) : action_server_(*node_handler, action_server_name, false)
+{
+    action_server_.registerGoalCallback(boost::bind(&ExecuteLioSamServer::goal_callback, this));
+    action_server_.registerPreemptCallback(boost::bind(&ExecuteLioSamServer::preempt_callback, this));
+    action_server_.start();
+}
+
+void ExecuteLioSamServer::goal_callback()
+{
+    // If the server is already processing a goal
+    if (busy_)
+    {
+        ROS_ERROR("The action will not be processed because the server is already busy with another action. "
+                "Please preempt the latter or wait before sending a new goal");
+        return;
+    }
+    ROS_INFO("Action callback");
+    // The first step is to accept a new goal. If you want to access to the input field, you should write
+    // new_goal_->input;
+    new_goal_ = action_server_.acceptNewGoal();
+    // Set busy to true
+    busy_ = true;
+    // Set wait
+    //ros::Rate r(2);
+
+    app_liosam_mode = new_goal_->liosam_mode;
+    app_map_name = new_goal_->map_name;
+    app_waiting_user = false;
+
+    // std::cout << "App liosam_mode: " << app_liosam_mode << std::endl;
+    // std::cout << "App map_name: " << app_map_name << std::endl;
+    // std::cout << "Waiting: " << app_waiting_user << std::endl;
+
+    if ((app_liosam_mode == 0) && (feedback_mode == 3))
+    {
+        ROS_INFO("Set SLAM");
+        action_feedback_.liosam_feedback_mode = 0;
+        action_feedback_.liosam_feedback_info = 0;
+    }
+
+    if ((app_liosam_mode == 1) && (feedback_mode == 3))
+    {
+        ROS_INFO("Set Localization");
+        action_feedback_.liosam_feedback_mode = 1;
+        action_feedback_.liosam_feedback_info = 0;
+    }
+
+    if (app_liosam_mode == 8)
+    {
+        ROS_INFO("Status");
+        action_feedback_.liosam_feedback_mode = feedback_mode;
+        action_feedback_.liosam_feedback_info = feedback_quality;
+    }
+
+    if ((app_liosam_mode == 10) && (feedback_mode == 3))
+    {
+        ROS_INFO("Kill command sent by app.");
+        app_initialized = false;
+        app_waiting_user = true;
+        app_liosam_mode = 9;
+    }
+
+    if (app_liosam_mode == 9)
+    {
+        ROS_INFO("Finish");
+        action_feedback_.liosam_feedback_mode = 2;
+        action_feedback_.liosam_feedback_info = 0;
+        toKill = true;
+    }
+
+    action_server_.publishFeedback(action_feedback_);
+    //r.sleep();
+
+    // Return the response of the action.
+    action_result_.liosam_result = feedback_quality;
+    action_server_.setSucceeded(action_result_);
+    // Set busy to false
+    busy_ = false;
+    
+    if (toKill == true)
+    {
+        std_msgs::String msg;
+        msg.data = "all";
+        pubKillNodes.publish(msg);
+        ROS_INFO("Sent kill signal to node: %s", msg.data.c_str());
+    }
+}
+
+void ExecuteLioSamServer::preempt_callback()
+{
+    ROS_INFO("Action preempted");
+    action_server_.setPreempted();
+}
+
+void shutdownNode(const std_msgs::String::ConstPtr& msg) {
+    ROS_INFO("Shutting down: Map Optimization.");
+    ros::shutdown();
+}
 
 int main(int argc, char** argv)
 {
     ros::init(argc, argv, "lio_sam");
 
     mapOptimization MO;
+
+    ExecuteLioSamServer execute_liosam_server_(&MO.nh, "lio_sam/execute_mode");
+    pubKillNodes = MO.nh.advertise<std_msgs::String>("lio_sam/kill_nodes", 1);
+    ros::Subscriber killSub = MO.nh.subscribe("lio_sam/kill_nodes", 10, shutdownNode);
 
     ROS_INFO("\033[1;32m----> Map Optimization Started.\033[0m");
     

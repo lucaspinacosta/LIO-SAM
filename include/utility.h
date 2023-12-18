@@ -4,6 +4,7 @@
 #define PCL_NO_PRECOMPILE 
 
 #include <ros/ros.h>
+#include <actionlib/server/simple_action_server.h>
 
 #include <std_msgs/Header.h>
 #include <std_msgs/Float32.h>
@@ -17,7 +18,13 @@
 #include <visualization_msgs/MarkerArray.h>
 #include <geometry_msgs/PoseWithCovarianceStamped.h>
 #include <geometry_msgs/Transform.h>
+#include <std_msgs/String.h>
+#include <std_srvs/Empty.h>
 
+#include <lio_sam/execute_liosamAction.h>
+#include <lio_sam/execute_liosamGoal.h>
+#include <lio_sam/execute_liosamFeedback.h>
+#include <lio_sam/execute_liosamResult.h>
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -61,9 +68,27 @@
 
 using namespace std;
 
+typedef std::numeric_limits< double > dbl;
+
 typedef pcl::PointXYZI PointType;
 
 enum class SensorType { VELODYNE, OUSTER, LIVOX, LEISHEN};
+
+// Scan Context
+enum class SCInputType {SINGLE_SCAN_FULL, SINGLE_SCAN_FEAT, MULTI_SCAN_FEAT};
+
+// App
+bool toSave = false;
+bool waitSaveLastPCD = true;
+bool app_waiting_user = false;
+bool app_initialized = false;
+int app_liosam_mode = 1;
+string app_map_name;
+string saveMainDirectory;
+int feedback_mode;
+int feedback_quality;
+ros::Publisher pubKillNodes;
+bool toKill = false;
 
 class ParamServer
 {
@@ -93,7 +118,15 @@ public:
 
     // Save pcd
     bool savePCD;
+    bool saveLastPCD;
+    double lastSaveSecs;
     string savePCDDirectory;
+    string savePCDDirectory_Q;
+    bool saveRawCloud;
+    bool eraseLOAMFolder;
+     // Save graph
+    bool saveGTSAM;
+    string saveGTSAMDirectory;
 
     // Lidar Sensor Configuration
     SensorType sensor;
@@ -155,6 +188,8 @@ public:
     float globalMapVisualizationSearchRadius;
     float globalMapVisualizationPoseDensity;
     float globalMapVisualizationLeafSize;
+    bool globalMapVisualizationFile;
+    bool globalMapVisualizationFileFilter;
 
     // Relocalize
     int relocalizeMode;
@@ -166,6 +201,27 @@ public:
     float setTransformationEpsilon;
     float setEuclideanFitnessEpsilon;
     int setRANSACIterations;
+
+    // Localization
+    int liosamMode;
+    int factorization;
+    bool graphTest;
+    bool performRSLoopClosureFlag;
+    bool performSCLoopClosureFlag;
+    bool scdInitialLocalization;
+    bool pcdInitialLocalization;
+    SCInputType scdInput;
+
+    bool icpLocalizationPreliminary;
+    bool icpLocalizationAscendingOrder;
+    int icpLocalizationStep;
+    float pcdLocalizationThreshold;
+
+    bool buildConfusionMatrix;
+
+    float covarianceMedium;
+    float covarianceHigh;
+    float priorNoiseVector;
 
     // Other
     bool pclRemoveNan;
@@ -200,7 +256,16 @@ public:
         nh.param<float>("lio_sam/poseCovThreshold", poseCovThreshold, 25.0);
 
         nh.param<bool>("lio_sam/savePCD", savePCD, false);
+        nh.param<bool>("lio_sam/saveLastPCD", saveLastPCD, true);
         nh.param<std::string>("lio_sam/savePCDDirectory", savePCDDirectory, "/Downloads/LOAM/");
+
+        nh.param<std::string>("lio_sam/savePCDDirectory_Q", savePCDDirectory_Q, "/Downloads/LOAM/");
+
+        nh.param<bool>("lio_sam/saveGTSAM", saveGTSAM, false);
+        nh.param<std::string>("lio_sam/saveGTSAMDirectory", saveGTSAMDirectory, "/Downloads/LOAM/GTSAM/");
+
+        nh.param<bool>("lio_sam/saveRawCloud", saveRawCloud, false);
+        nh.param<bool>("lio_sam/eraseLOAMFolder", eraseLOAMFolder, false);
 
         std::string sensorStr;
         nh.param<std::string>("lio_sam/sensor", sensorStr, "");
@@ -223,7 +288,7 @@ public:
         else
         {
             ROS_ERROR_STREAM(
-                "Invalid sensor type (must be either 'velodyne' or 'ouster' or 'livox'): " << sensorStr);
+                "Invalid sensor type (must be either 'velodyne' or 'ouster' or 'livox' or 'leishen'): " << sensorStr);
             ros::shutdown();
         }
 
@@ -279,7 +344,52 @@ public:
         nh.param<float>("lio_sam/globalMapVisualizationPoseDensity", globalMapVisualizationPoseDensity, 10.0);
         nh.param<float>("lio_sam/globalMapVisualizationLeafSize", globalMapVisualizationLeafSize, 1.0);
 
+        nh.param<bool>("lio_sam/globalMapVisualizationFile", globalMapVisualizationFile, false);
+        nh.param<bool>("lio_sam/globalMapVisualizationFileFilter", globalMapVisualizationFileFilter, true);
+
         nh.param<bool>("lio_sam/pclRemoveNan", pclRemoveNan, true);
+
+        nh.param<int>("lio_sam/liosamMode", liosamMode, 0);
+        nh.param<int>("lio_sam/factorization", factorization, 0); // CHOLESKY default
+        nh.param<bool>("lio_sam/graphTest", graphTest, false);
+
+        nh.param<bool>("lio_sam/performRSLoopClosureFlag", performRSLoopClosureFlag, true); 
+        nh.param<bool>("lio_sam/performSCLoopClosureFlag", performSCLoopClosureFlag, false);
+        
+        nh.param<bool>("lio_sam/pcdInitialLocalization", pcdInitialLocalization, true);
+        nh.param<float>("lio_sam/pcdLocalizationThreshold", pcdLocalizationThreshold, 0.0);
+        nh.param<bool>("lio_sam/scdInitialLocalization", scdInitialLocalization, false);
+
+        nh.param<bool>("lio_sam/icpLocalizationPreliminary", icpLocalizationPreliminary, false);
+        nh.param<bool>("lio_sam/icpLocalizationAscendingOrder", icpLocalizationAscendingOrder, true);
+        nh.param<int>("lio_sam/icpLocalizationStep", icpLocalizationStep, 1);
+
+        std::string scInputStr;
+        nh.param<std::string>("lio_sam/scdInput", scInputStr, "");
+        if (scInputStr == "single_scan")
+        {
+            scdInput = SCInputType::SINGLE_SCAN_FULL;
+        }
+        else if (scInputStr == "single_feature")
+        {
+            scdInput = SCInputType::SINGLE_SCAN_FEAT;
+        }
+        else if (scInputStr == "multi_scan")
+        {
+            scdInput = SCInputType::MULTI_SCAN_FEAT;
+        }
+        else
+        {
+            ROS_ERROR_STREAM(
+                "Invalid scan type: " << scInputStr);
+            ros::shutdown();
+        }
+
+        nh.param<bool>("lio_sam/buildConfusionMatrix", buildConfusionMatrix, false);
+
+        nh.param<float>("lio_sam/covarianceMedium", covarianceMedium, 1.0);
+        nh.param<float>("lio_sam/covarianceHigh", covarianceHigh, 2.0);
+        nh.param<float>("lio_sam/priorNoiseVector", priorNoiseVector, 0.1);
 
         usleep(100);
     }
@@ -378,5 +488,83 @@ float pointDistance(PointType p1, PointType p2)
 {
     return sqrt((p1.x-p2.x)*(p1.x-p2.x) + (p1.y-p2.y)*(p1.y-p2.y) + (p1.z-p2.z)*(p1.z-p2.z));
 }
+
+void saveSCD(std::string fileName, Eigen::MatrixXd matrix, std::string delimiter = " ")
+{
+    // delimiter: ", " or " " etc.
+
+    int precision = 3; // or Eigen::FullPrecision, but SCD does not require such accruate precisions so 3 is enough.
+    const static Eigen::IOFormat the_format(precision, Eigen::DontAlignCols, delimiter, "\n");
+
+    std::ofstream file(fileName);
+    if (file.is_open())
+    {
+        file << matrix.format(the_format);
+        file.close();
+    }
+}
+
+Eigen::MatrixXd loadSCD(std::string fileName, int ring, int sector)
+{
+    double temp;
+    vector<double> buff;
+
+    // Read numbers from file into buffer.
+    ifstream infile;
+    infile.open(fileName);
+    while (! infile.eof())
+    {
+        string line;
+        getline(infile, line);
+
+        stringstream stream(line);
+        while(! stream.eof())
+        {
+            stream >> temp;
+            buff.push_back(temp);
+        }
+    }
+
+    // Populate matrix with numbers.
+    Eigen::MatrixXd result(ring,sector);
+    for (int i = 0; i < ring; i++)
+        for (int j = 0; j < sector; j++)
+            result(i,j) = buff.at(sector*i + j);
+
+    return result;
+}
+
+std::string padZeros(int val, int num_digits = 6) {
+  std::ostringstream out;
+  out << std::internal << std::setfill('0') << std::setw(num_digits) << val;
+  return out.str();
+}
+
+int dirExists(const char *path);
+
+class ExecuteLioSamServer
+{
+  public:
+    // Constructor
+    ExecuteLioSamServer(ros::NodeHandle* node_handler, std::string action_server_name);
+
+  private:
+    // Change actionName by the name of your ROS package and action file
+    actionlib::SimpleActionServer<lio_sam::execute_liosamAction> action_server_;
+    // Declare and initialise the message containing the outcome of the action
+    lio_sam::execute_liosamResult action_result_;
+    // Declare and initialise a actionNameFeedback containing the feedback to send during the execution
+    lio_sam::execute_liosamFeedback action_feedback_;
+    // Declare and initialise an actionNameGoal containing the goal sent to the server
+    lio_sam::execute_liosamGoalConstPtr new_goal_;
+    // Declare and initialise a boolean storing the state of the server
+    bool busy_ = false;
+
+    int goal;
+
+    // Internal method executing all the steps required when receiving a new goal or preempting an action
+    void goal_callback();
+    void preempt_callback();
+};
 
 #endif

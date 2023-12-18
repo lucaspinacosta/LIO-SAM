@@ -19,6 +19,8 @@ find_package(catkin REQUIRED COMPONENTS
   nav_msgs
   message_generation
   visualization_msgs
+  actionlib_msgs
+  actionlib
 )
 
 find_package(OpenMP REQUIRED)
@@ -39,12 +41,18 @@ add_service_files(
   save_map.srv
 )
 
+add_action_files(
+  DIRECTORY action
+  FILES execute_liosam.action
+)
+
 generate_messages(
   DEPENDENCIES
   geometry_msgs
   std_msgs
   nav_msgs
   sensor_msgs
+  actionlib_msgs
 )
 
 catkin_package(
@@ -93,7 +101,7 @@ add_dependencies(${PROJECT_NAME}_featureExtraction ${catkin_EXPORTED_TARGETS} ${
 target_link_libraries(${PROJECT_NAME}_featureExtraction ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
 
 # Mapping Optimization
-add_executable(${PROJECT_NAME}_mapOptmization src/mapOptmization.cpp)
+add_executable(${PROJECT_NAME}_mapOptmization src/mapOptmization.cpp src/Scancontext.cpp)
 add_dependencies(${PROJECT_NAME}_mapOptmization ${catkin_EXPORTED_TARGETS} ${PROJECT_NAME}_generate_messages_cpp)
 target_compile_options(${PROJECT_NAME}_mapOptmization PRIVATE ${OpenMP_CXX_FLAGS})
 target_link_libraries(${PROJECT_NAME}_mapOptmization Boost::timer ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} ${OpenMP_CXX_FLAGS} gtsam)

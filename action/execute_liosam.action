@@ -1,0 +1,10 @@
+# Define the goal
+int8 liosam_mode
+string map_name
+---
+# Define the result
+int8 liosam_result
+---
+# Define a feedback message
+int8 liosam_feedback_mode
+int8 liosam_feedback_info

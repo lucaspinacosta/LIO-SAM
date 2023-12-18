@@ -257,12 +257,17 @@ public:
     }
 };
 
+void shutdownNode(const std_msgs::String::ConstPtr& msg) {
+    ROS_INFO("Shutting down: Feature Extraction.");
+    ros::shutdown();
+}
 
 int main(int argc, char** argv)
 {
     ros::init(argc, argv, "lio_sam");
 
     FeatureExtraction FE;
+    ros::Subscriber killSub = FE.nh.subscribe("lio_sam/kill_nodes", 10, shutdownNode);
 
     ROS_INFO("\033[1;32m----> Feature Extraction Started.\033[0m");
    

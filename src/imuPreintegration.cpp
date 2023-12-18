@@ -550,12 +550,17 @@ public:
     }
 };
 
+void shutdownNode(const std_msgs::String::ConstPtr& msg) {
+    ROS_INFO("Shutting down: IMU Preintegration.");
+    ros::shutdown();
+}
 
 int main(int argc, char** argv)
 {
     ros::init(argc, argv, "roboat_loam");
     
     IMUPreintegration ImuP;
+    ros::Subscriber killSub = ImuP.nh.subscribe("lio_sam/kill_nodes", 10, shutdownNode);
 
     TransformFusion TF;
 
